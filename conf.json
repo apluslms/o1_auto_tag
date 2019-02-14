@@ -1,0 +1,23 @@
+{
+    "hook_token":      "foobar",
+    "api_token":       "953192c3371f16fea9dc9c31b3c2f5022cf697cc",
+    "base_url":        "http://localhost:8000/api/v2/",
+    "courses_url":     "/courses/",
+    "exercises_url":   "/exercises/",
+    "submissions_url": "/submissions/",
+    "taggings_url":    "/taggings/",
+    "taggings_query":  "?tag_id=",
+    "course_id":       1,
+    "exercise_ids":    [439],
+    "server_address":  ["", 8888],
+    "wait_after_post": 5,
+    "tag_for_form_value": {
+        "kielitaito": {
+            "suomi":    "fi",
+            "ruotsi":   "sv",
+            "englanti": "en"
+        }
+    },
+    "worker_count":    5,
+    "worker_interval": 0.1
+}

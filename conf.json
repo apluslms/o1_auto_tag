@@ -1,7 +1,7 @@
 {
     "hook_token":      "foobar",
-    "api_token":       "953192c3371f16fea9dc9c31b3c2f5022cf697cc",
-    "base_url":        "http://localhost:8000/api/v2/",
+    "api_token":       "a7a90c4bfe5c219292c99e138eb559b22c4f1bdf",
+    "base_url":        "http://172.18.0.3:8000/api/v2/",
     "courses_url":     "/courses/",
     "exercises_url":   "/exercises/",
     "submissions_url": "/submissions/",

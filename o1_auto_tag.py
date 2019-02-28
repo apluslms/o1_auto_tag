@@ -4,6 +4,7 @@ import logging
 import json
 import datetime
 import queue
+import requests
 from aplus_client.client import AplusTokenClient, AplusApiList, AplusApiDict
 from argparse import ArgumentParser
 from http.server import BaseHTTPRequestHandler, HTTPServer
@@ -17,7 +18,8 @@ from cachetools import cached, TTLCache
 
 #TODO:
 ''' 
- check that site url (key 'site') resolves to ip of REMOTE_ADDR - https://github.com/Aalto-LeTech/a-plus/blob/master/lib/helpers.py#L113
+Create tag when one doesn't yet exist
+
 '''
 
 conf_file = "conf.json"
@@ -38,7 +40,7 @@ this_logger_name = "TagLogger"
 logging.basicConfig()
 logger = logging.getLogger(this_logger_name) 
 #print(args.verbose)
-logger.setLevel(level=logging.WARNING if args.verbose < 1  else
+logger.setLevel(level=logging.WARNING if args.verbose == None else
                       logging.INFO    if args.verbose == 1 else 
                       logging.DEBUG   if args.verbose == 2 else 
                       logging.DEBUG)
@@ -63,20 +65,31 @@ def how_recent_in_hours(ISO8601_datetime_string):
     time_delta_hours = time_delta.total_seconds() / 3600
     return round(time_delta_hours, 1)
 
+@cached(TTLCache(100, ttl=30))
+def get_url_ip_address_list(hostname):
+    ips = (a[4][0] for a in socket.getaddrinfo(hostname, None, 0, socket.SOCK_STREAM, socket.IPPROTO_TCP))
+    return tuple(set(ips))
+
+def send_response(self, code, headers=None, msg=""):
+    self.send_response(code)
+    if headers:
+        self.end_headers(headers)
+    else:
+        self.end_headers()
+    self.wfile.write(b'Deceptive: sender ip does not match POST parameter') # Should this hint be given?
+
 
 def add_tagging(exercise_id, submission_id):
     if exercise_id not in CONF['exercise_ids']:
         return
-    
-    logger.info("")
-    logger.info("submission_id: {id}".format(id=submission_id))
+    logger.info("Getting submission with id %s", submission_id)
     submission = get_submission(submission_id)
+    if not submission:
+        logger.warning("Submission fetch failed. API token is likely invalid.")
+        return
     submitters = submission['submitters']
     submission_data = submission.get_item('submission_data')
-    
-    logger.info("submission_data:")
-    logger.info(pformat(submission_data))
-
+    logger.info("submission data: \n%s", pformat(submission_data))
     tag_slugs = (CONF['tag_for_form_value'][field[0]][field[1]]
                  for field in submission_data
                  if field[0] in CONF['tag_for_form_value'])
@@ -97,11 +110,13 @@ def add_tagging(exercise_id, submission_id):
         # r is a Requests Response object
         r = api.do_post('{courses_url}{course_id}{taggings_url}'
                         .format(**CONF), json=data)
-        logger.info("")
-        logger.info("With {code}".format(code=r.status_code))
-        if r.status_code is not '201':
-            logger.info(r.json())
-            logger.info("")
+        logger.debug("")
+        logger.debug("With {code}".format(code=r.status_code))
+        if r.status_code == requests.codes.created: # 201
+            logger.info("Added tagging %s to user %s", data['tag'], data['user'])
+        else:
+            logger.debug(r.json())
+            logger.debug("")
 
 
 class IntervalCallQueue():
@@ -115,7 +130,6 @@ class IntervalCallQueue():
         self._workers = [Worker(self._queue, self.stop_marker, interval_s) for _ in range(CONF["worker_count"])]
     
     def schedule(self, f, *args):
-        #logger.info("Putting into queue...") 
         self._queue.put((f, args))
 
     def stop(self):
@@ -137,49 +151,37 @@ class QueuingHTTPServer(HTTPServer):
 
 
 class APlusCourseHookHTTPRequestHandler(BaseHTTPRequestHandler):
-    @cached(TTLCache(100, ttl=30))
-    def get_url_ip_address_list(self, url):
-        """
-        This function takes a full URL as a parameter and returns the IP addresses
-        of the host as a string.
-        It will cache results for 30 seconds, so repeated calls return fast
-        """
-        hostname = urlsplit(url).hostname
-        assert hostname, "Invalid url: no hostname found"
-        ips = (a[4][0] for a in socket.getaddrinfo(hostname, None, 0, socket.SOCK_STREAM, socket.IPPROTO_TCP))
-        return tuple(set(ips))
-    
     def do_POST(self):
         parameters = parse_qs(urlsplit(self.path).query)
         content_length = int(self.headers['Content-Length'])
         post_data = parse_qs(self.rfile.read(content_length).decode('utf-8'))
         token = (post_data.get('token') or parameters.get('token') or (None,))[0]
-        logger.info("With token {token}".format(token=token))
+        logger.info("HOOK with token {token}".format(token=token))
         hook_token = CONF.get('hook_token')
         if hook_token and (not token or token != hook_token):
-            logger.warning('Hook token doesn\'t match or was missing in POST')
-            self.send_response(401)
-            self.end_headers()
-            self.wfile.write(b'Bad auth token: missing or invalid')
+            logger.debug('Hook token doesn\'t match or was missing in POST')
+            send_response(self, 401, msg=b'Bad auth token: missing or invalid')
             return
-        reported_site = post_data.get('site')[0]
-        supposed_ips = self.get_url_ip_address_list(reported_site)
-        client_ip = self.client_address[0]  # What about port?
-        if client_ip not in supposed_ips[0]: 
-            logger.warning('Client ip doesn\'t match reported in POST body')
-            self.send_response(400)
-            self.end_headers()
-            self.wfile.write(b'Deceptive: sender ip does not match POST parameter') # Should this hint be given?
+        reported_site_parsed = urlsplit(post_data.get('site')[0])
+        base_url_netloc = urlsplit(CONF['base_url']).netloc 
+        reported_netloc = reported_site_parsed.netloc
+        if base_url_netloc != reported_netloc: # and False:
+            logger.debug('base_url netloc in config %s doesn\'t match POST parameter \'site\' %s netloc', 
+                         base_url_netloc,
+                         reported_netloc)
+            send_response(self, 400, msg="Base url given in parameter 'site' does not match config")
+            return
+        supposed_ips = get_url_ip_address_list(reported_site_parsed.hostname)
+        client_ip = self.client_address[0]
+        if client_ip not in supposed_ips: 
+            logger.debug('Client ip %s doesn\'t match reported ips %s in POST body', client_ip, supposed_ips)
+            send_response(self, 400, msg="Deceptive: client does not match POST parameter 'site' after resolve")
             return
 
         exercise_id, *_ = (int(id) for id in post_data['exercise_id'])
         submission_id, *_ = (int(id) for id in post_data['submission_id'])
-        # Wait before making requests to A+, because the submission is not ready
-        # to be read from the API when A+ calls the hook
         self.server.call_queue.schedule(add_tagging, exercise_id, submission_id)
-        self.send_response(204)
-        self.end_headers()
-        self.wfile.write(b'OK')
+        send_response(self, 204, msg="OK")
 
 
 def run_server(server_class=QueuingHTTPServer,
@@ -190,7 +192,7 @@ def run_server(server_class=QueuingHTTPServer,
     except KeyboardInterrupt:
         pass
     finally:
-        logger.info("Gracefully shutting down server...") # TODO: how many workers left
+        logger.info("Gracefully shutting down server...")
         httpd.server_close()
 
 
@@ -211,10 +213,16 @@ def do_batch(hours_since):
 
 
 if __name__ == '__main__':
+    did = ""
     if args.batch:
         logger.info('\n'*2)
         logger.info("Running batch")
-        do_batch(args.batch) 
+        do_batch(args.batch)
+        did += "b"
     if args.server:
         logger.info("Running server")
         run_server()
+        did += "s"
+    if did == "":
+        logger.warning("No flags given")
+

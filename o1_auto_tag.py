@@ -1,62 +1,40 @@
 #!/usr/bin/env python3
-import time
-import socket
-import logging
-import json
 import datetime
+import json
+import logging
 import queue
 import requests
-from aplus_client.client import AplusTokenClient, AplusApiList, AplusApiDict
+import socket
+import time
 from argparse import ArgumentParser
 from http.server import BaseHTTPRequestHandler, HTTPServer
+from socketserver import UnixStreamServer
 from itertools import chain
-from threading import Timer, Event
-from urllib.parse import parse_qs, urlsplit
 from pprint import pprint, pformat
 from queue_worker import Worker
-from cachetools import cached, TTLCache
+from threading import Timer, Event
+from urllib.parse import parse_qs, urlsplit
 
+from aplus_client.client import AplusTokenClient, AplusApiList, AplusApiDict
+from cachetools import cached, TTLCache
 
 #TODO:
 ''' 
 README.md
 '''
 
-conf_file = "conf.json"
-
-with open(conf_file, "r") as f:
-    CONF = json.load(f)
-
-p = ArgumentParser()
-p.add_argument('-v', '--verbose', action='count',
-               help="Print more information, stackable")
-p.add_argument('-s', '--server', action='store_true', 
-               help="Run the server")
-p.add_argument('-b', '--batch',
-               help="Run a batch job, go through tags from last N hours", type=int)
-args = p.parse_args()
 
 this_logger_name = "TagLogger"
-logging.basicConfig()
 logger = logging.getLogger(this_logger_name) 
-logger.setLevel(level=logging.WARNING if args.verbose == None else
-                      logging.INFO    if args.verbose == 1 else 
-                      logging.DEBUG   if args.verbose == 2 else 
-                      logging.DEBUG)
-
-api = AplusTokenClient(CONF['api_token'])
-api.set_base_url_from(CONF['base_url'])
-
-sess = requests.Session()
 
 
 def get_submission(submission_id):
     return api.load_data('{submissions_url}{submission_id}'
-                         .format(**CONF, submission_id=submission_id))
+                         .format(submission_id=submission_id, **CONF))
 
 def get_submissions_list(exercise_id):
     return api.load_data('{exercises_url}{exercise_id}{submissions_url}'
-                         .format(**CONF, exercise_id=exercise_id))
+                         .format(exercise_id=exercise_id, **CONF))
 
 def get_usertags():
     return api.load_data('{courses_url}{course_id}{usertags_url}'
@@ -98,6 +76,8 @@ def send_response(Handler, code, headers=None, msg=""):
         Handler.end_headers(headers)
     else:
         Handler.end_headers()
+    if isinstance(msg, str):
+        msg = msg.encode('utf-8')
     Handler.wfile.write(msg)
 
 
@@ -166,8 +146,8 @@ class IntervalCallQueue():
             worker.join()
             logger.info("Worker #{number} stopped".format(number=i+1))
 
-    
-class QueuingHTTPServer(HTTPServer):
+
+class QueueMixin: 
     def __init__(self, *args, **kwargs):
         self.call_queue = IntervalCallQueue(CONF["worker_interval"])
         super().__init__(*args, **kwargs)
@@ -175,6 +155,14 @@ class QueuingHTTPServer(HTTPServer):
     def server_close(self):
         self.call_queue.stop()
         super().server_close()
+
+    
+class QueuingHTTPServer(QueueMixin, HTTPServer):
+    pass
+
+
+class QueuingUnixServer(QueueMixin, UnixStreamServer):
+    pass
 
 
 class APlusCourseHookHTTPRequestHandler(BaseHTTPRequestHandler):
@@ -187,7 +175,7 @@ class APlusCourseHookHTTPRequestHandler(BaseHTTPRequestHandler):
         hook_token = CONF.get('hook_token')
         if hook_token and (not token or token != hook_token):
             logger.debug('Hook token doesn\'t match or was missing in POST')
-            send_response(self, 401, msg=b'Bad auth token: missing or invalid')
+            send_response(self, 401, msg='Bad auth token: missing or invalid')
             return
         reported_site_parsed = urlsplit(post_data.get('site')[0])
         base_url_netloc = urlsplit(CONF['base_url']).netloc 
@@ -195,13 +183,13 @@ class APlusCourseHookHTTPRequestHandler(BaseHTTPRequestHandler):
         if base_url_netloc != reported_netloc:
             logger.debug('base_url netloc in config %s doesn\'t match POST parameter \'site\' %s netloc', 
                          base_url_netloc, reported_netloc)
-            send_response(self, 400, msg=b"Base url given in parameter 'site' does not match config")
+            send_response(self, 400, msg="Base url given in parameter 'site' does not match config")
             return
         supposed_ips = get_url_ip_address_list(reported_site_parsed.hostname)
         client_ip = self.client_address[0]
         if client_ip not in supposed_ips: 
             logger.debug('Client ip %s doesn\'t match reported ips %s in POST body', client_ip, supposed_ips)
-            send_response(self, 400, msg=b"Deceptive: client does not match POST parameter 'site' after resolve")
+            send_response(self, 400, msg="Deceptive: client does not match POST parameter 'site' after resolve")
             return
 
         exercise_id, *_ = (int(id) for id in post_data['exercise_id'])
@@ -256,10 +244,54 @@ def do_batch(hours_since):
         logger.info("    -- Added taggings from %s/%s submissions\n\n", added_count, len(submissions))
 
 
+CONF = {
+    "hook_token":      "testing",
+    "courses_url":     "/courses/",
+    "exercises_url":   "/exercises/",
+    "submissions_url": "/submissions/",
+    "usertags_url":    "/usertags/",
+    "taggings_url":    "/taggings/",
+    "taggings_query":  "?tag_id=",
+}
 
-if __name__ == '__main__':
-    did = ""
+api = None
+sess = None
+
+def setup(conf_file):
+    global api, sess
+
+    with open(conf_file, "r") as f:
+       CONF.update(json.load(f))
+
+    api = AplusTokenClient(CONF['api_token'])
+    api.set_base_url_from(CONF['base_url'])
+
+    sess = requests.Session()
+
+    logging.basicConfig()
+
+
+def main(): 
+    p = ArgumentParser()
+    p.add_argument('-c', '--config', type=str, default='conf.json')
+    p.add_argument('-v', '--verbose', action='count',
+               help="Print more information, stackable")
+    p.add_argument('-s', '--server', action='store_true', 
+               help="Run the server")
+    p.add_argument('-b', '--batch',
+               help="Run a batch job, go through tags from last N hours", type=int)
+    args = p.parse_args()
+    
+    setup(args.config)
+
+    logger.setLevel(level=logging.WARNING if args.verbose == None else
+                          logging.INFO    if args.verbose == 1 else 
+                          logging.DEBUG   if args.verbose == 2 else 
+                          logging.DEBUG)
+ 
     sync_tags()
+
+    did = ""
     if args.batch:
         logger.info("Running batch")
         do_batch(args.batch)
@@ -271,3 +303,6 @@ if __name__ == '__main__':
     if did == "":
         logger.warning("No flags given")
 
+
+if __name__ == '__main__': 
+    main()

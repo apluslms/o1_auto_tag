@@ -1,13 +1,6 @@
 {
-    "hook_token":      "testing",
     "api_token":       "fcba67540810f2ed7f8b0a1765163d1427d6fd2f",
     "base_url":        "http://172.20.0.3:8000/api/v2/",
-    "courses_url":     "/courses/",
-    "exercises_url":   "/exercises/",
-    "submissions_url": "/submissions/",
-    "usertags_url":    "/usertags/",
-    "taggings_url":    "/taggings/",
-    "taggings_query":  "?tag_id=",
     "course_id":       1,
     "exercise_ids":    [439],
     "server_address":  ["", 8888],

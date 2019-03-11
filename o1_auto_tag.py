@@ -19,9 +19,7 @@ from cachetools import cached, TTLCache
 
 #TODO:
 ''' 
-If mapping doesn't exist, skip
-Give Worker threads at least somewhat useful names, 
-these can be then printed out when stopping them
+README.md
 '''
 
 conf_file = "conf.json"
@@ -94,29 +92,23 @@ def get_url_ip_address_list(hostname):
     ips = (a[4][0] for a in socket.getaddrinfo(hostname, None, 0, socket.SOCK_STREAM, socket.IPPROTO_TCP))
     return tuple(set(ips))
 
-def send_response(self, code, headers=None, msg=""):
-    self.send_response(code)
+def send_response(Handler, code, headers=None, msg=""):
+    Handler.send_response(code)
     if headers:
-        self.end_headers(headers)
+        Handler.end_headers(headers)
     else:
-        self.end_headers()
-    self.wfile.write(b'Deceptive: sender ip does not match POST parameter')
+        Handler.end_headers()
+    Handler.wfile.write(msg)
 
 
-def add_tagging(exercise_id, submission_id):
-    if exercise_id not in CONF['exercise_ids']:
-        return
-    logger.info("Submission with id %s", submission_id)
-    submission = get_submission(submission_id)
-    if not submission:
-        logger.warning("Submission fetch failed. API token is likely invalid.")
-        return
+def submission_to_tag_post(submission): 
     submitters = submission['submitters']
     submission_data = submission.get_item('submission_data')
     logger.debug("submission data: \n%s", pformat(submission_data))
     tag_slugs = (CONF['tag_for_form_value'][field[0]][field[1]]
                  for field in submission_data
-                 if field[0] in CONF['tag_for_form_value'])
+                 if    field[0] in CONF['tag_for_form_value']
+                   and field[1] in CONF['tag_for_form_value'][field[0]])
     user_ids = (submitter['id'] for submitter in submitters)
     post_dataset = (
         {
@@ -129,6 +121,19 @@ def add_tagging(exercise_id, submission_id):
         }
         for user_id in user_ids
         for tag_slug in tag_slugs)
+    return post_dataset
+
+
+def add_tagging(exercise_id, submission_id):
+    if exercise_id not in CONF['exercise_ids']:
+        return
+    logger.info("Submission with id %s", submission_id)
+    submission = get_submission(submission_id)
+    if not submission:
+        logger.warning("Submission fetch failed. API token is likely invalid.")
+        return
+
+    post_dataset = submission_to_tag_post(submission)
 
     for data in post_dataset:
         slug = data['tag']['slug']
@@ -190,13 +195,13 @@ class APlusCourseHookHTTPRequestHandler(BaseHTTPRequestHandler):
         if base_url_netloc != reported_netloc:
             logger.debug('base_url netloc in config %s doesn\'t match POST parameter \'site\' %s netloc', 
                          base_url_netloc, reported_netloc)
-            send_response(self, 400, msg="Base url given in parameter 'site' does not match config")
+            send_response(self, 400, msg=b"Base url given in parameter 'site' does not match config")
             return
         supposed_ips = get_url_ip_address_list(reported_site_parsed.hostname)
         client_ip = self.client_address[0]
         if client_ip not in supposed_ips: 
             logger.debug('Client ip %s doesn\'t match reported ips %s in POST body', client_ip, supposed_ips)
-            send_response(self, 400, msg="Deceptive: client does not match POST parameter 'site' after resolve")
+            send_response(self, 400, msg=b"Deceptive: client does not match POST parameter 'site' after resolve")
             return
 
         exercise_id, *_ = (int(id) for id in post_data['exercise_id'])

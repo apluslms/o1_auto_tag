@@ -1,4 +1,5 @@
 #!/usr/bin/env python3
+import time
 import socket
 import logging
 import json
@@ -18,8 +19,9 @@ from cachetools import cached, TTLCache
 
 #TODO:
 ''' 
-Create tag when one doesn't yet exist
-
+If mapping doesn't exist, skip
+Give Worker threads at least somewhat useful names, 
+these can be then printed out when stopping them
 '''
 
 conf_file = "conf.json"
@@ -29,7 +31,7 @@ with open(conf_file, "r") as f:
 
 p = ArgumentParser()
 p.add_argument('-v', '--verbose', action='count',
-               help="Print logger.messages")
+               help="Print more information, stackable")
 p.add_argument('-s', '--server', action='store_true', 
                help="Run the server")
 p.add_argument('-b', '--batch',
@@ -39,7 +41,6 @@ args = p.parse_args()
 this_logger_name = "TagLogger"
 logging.basicConfig()
 logger = logging.getLogger(this_logger_name) 
-#print(args.verbose)
 logger.setLevel(level=logging.WARNING if args.verbose == None else
                       logging.INFO    if args.verbose == 1 else 
                       logging.DEBUG   if args.verbose == 2 else 
@@ -47,6 +48,8 @@ logger.setLevel(level=logging.WARNING if args.verbose == None else
 
 api = AplusTokenClient(CONF['api_token'])
 api.set_base_url_from(CONF['base_url'])
+
+sess = requests.Session()
 
 
 def get_submission(submission_id):
@@ -56,6 +59,27 @@ def get_submission(submission_id):
 def get_submissions_list(exercise_id):
     return api.load_data('{exercises_url}{exercise_id}{submissions_url}'
                          .format(**CONF, exercise_id=exercise_id))
+
+def get_usertags():
+    return api.load_data('{courses_url}{course_id}{usertags_url}'
+                         .format(**CONF))
+
+def post_tagging(data):
+    return api.do_post('{courses_url}{course_id}{taggings_url}'
+                        .format(**CONF), json=data)
+
+def post_usertag(**data):
+    return api.do_post('{courses_url}{course_id}{usertags_url}'
+                       .format(**CONF), json=data)    
+
+def default_tag(name, slug):
+    return { 
+               "name":                name,
+               "slug":                slug,
+               "description":         'Auto added by o1_auto_tag.py',
+               "color":               '#000000',
+               "visible_to_students": False
+           }
 
 def how_recent_in_hours(ISO8601_datetime_string):
     # Times in UTC
@@ -76,20 +100,20 @@ def send_response(self, code, headers=None, msg=""):
         self.end_headers(headers)
     else:
         self.end_headers()
-    self.wfile.write(b'Deceptive: sender ip does not match POST parameter') # Should this hint be given?
+    self.wfile.write(b'Deceptive: sender ip does not match POST parameter')
 
 
 def add_tagging(exercise_id, submission_id):
     if exercise_id not in CONF['exercise_ids']:
         return
-    logger.info("Getting submission with id %s", submission_id)
+    logger.info("Submission with id %s", submission_id)
     submission = get_submission(submission_id)
     if not submission:
         logger.warning("Submission fetch failed. API token is likely invalid.")
         return
     submitters = submission['submitters']
     submission_data = submission.get_item('submission_data')
-    logger.info("submission data: \n%s", pformat(submission_data))
+    logger.debug("submission data: \n%s", pformat(submission_data))
     tag_slugs = (CONF['tag_for_form_value'][field[0]][field[1]]
                  for field in submission_data
                  if field[0] in CONF['tag_for_form_value'])
@@ -107,16 +131,14 @@ def add_tagging(exercise_id, submission_id):
         for tag_slug in tag_slugs)
 
     for data in post_dataset:
+        slug = data['tag']['slug']
         # r is a Requests Response object
-        r = api.do_post('{courses_url}{course_id}{taggings_url}'
-                        .format(**CONF), json=data)
-        logger.debug("")
-        logger.debug("With {code}".format(code=r.status_code))
-        if r.status_code == requests.codes.created: # 201
+        r_tagging = post_tagging(data)
+        logger.debug("Response with %s", r_tagging.status_code)
+        if r_tagging.status_code == requests.codes.created: # 201
             logger.info("Added tagging %s to user %s", data['tag'], data['user'])
         else:
-            logger.debug(r.json())
-            logger.debug("")
+            logger.debug("%s\n ", r_tagging.json())
 
 
 class IntervalCallQueue():
@@ -156,7 +178,7 @@ class APlusCourseHookHTTPRequestHandler(BaseHTTPRequestHandler):
         content_length = int(self.headers['Content-Length'])
         post_data = parse_qs(self.rfile.read(content_length).decode('utf-8'))
         token = (post_data.get('token') or parameters.get('token') or (None,))[0]
-        logger.info("HOOK with token {token}".format(token=token))
+        logger.info("HOOK with token %s", token)
         hook_token = CONF.get('hook_token')
         if hook_token and (not token or token != hook_token):
             logger.debug('Hook token doesn\'t match or was missing in POST')
@@ -165,10 +187,9 @@ class APlusCourseHookHTTPRequestHandler(BaseHTTPRequestHandler):
         reported_site_parsed = urlsplit(post_data.get('site')[0])
         base_url_netloc = urlsplit(CONF['base_url']).netloc 
         reported_netloc = reported_site_parsed.netloc
-        if base_url_netloc != reported_netloc: # and False:
+        if base_url_netloc != reported_netloc:
             logger.debug('base_url netloc in config %s doesn\'t match POST parameter \'site\' %s netloc', 
-                         base_url_netloc,
-                         reported_netloc)
+                         base_url_netloc, reported_netloc)
             send_response(self, 400, msg="Base url given in parameter 'site' does not match config")
             return
         supposed_ips = get_url_ip_address_list(reported_site_parsed.hostname)
@@ -184,8 +205,23 @@ class APlusCourseHookHTTPRequestHandler(BaseHTTPRequestHandler):
         send_response(self, 204, msg="OK")
 
 
+def sync_tags():
+    usertags = get_usertags()
+    existing_slugs = [tag['slug'] for tag in usertags]
+    for field_name, value_to_slug in CONF['tag_for_form_value'].items():
+        missing_mappings = filter(lambda x: x[1] not in existing_slugs, value_to_slug.items())
+        for value, slug in missing_mappings:
+            tag_name = field_name + value.capitalize()
+            r_usertag = post_usertag(**default_tag(name=tag_name, slug=slug))
+            if r_usertag.status_code == requests.codes.created:
+                logger.info("Added tag with slug %s", slug)
+            else:
+                logger.info("Adding usertag failed")
+                logger.debug("Usertag data:\n%s", r_usertag.request.body)
+
+
 def run_server(server_class=QueuingHTTPServer,
-        handler_class=APlusCourseHookHTTPRequestHandler):
+               handler_class=APlusCourseHookHTTPRequestHandler):
     httpd = server_class(tuple(CONF['server_address']), handler_class)
     try:
         httpd.serve_forever()
@@ -198,24 +234,28 @@ def run_server(server_class=QueuingHTTPServer,
 
 def do_batch(hours_since):
     for exercise_id in CONF['exercise_ids']:
+        logger.info("Exercise with ID %s\n", exercise_id)
         submissions = get_submissions_list(exercise_id)
+        added_count = 0
         for submission in submissions:
             age_hours = how_recent_in_hours(submission['submission_time'])
-            logger.info("")
-            logger.info("Submission with ID {id} is {hours} hours old".format(id=submission['id'], hours=age_hours))
+            logger.debug("Submission with ID %s is %s hours old", submission['id'], age_hours)
             if age_hours < hours_since:
-                logger.info("-> try to add tags")
+                logger.debug("-> add taggings")
                 add_tagging(exercise_id, submission['id'])
+                added_count += 1
             else:
-                logger.info("-> don't try to add tags")
-                logger.info("stopping\n")
+                logger.debug("-> don't add taggings")
+                logger.debug("stopping")
                 break
+        logger.info("    -- Added taggings from %s/%s submissions\n\n", added_count, len(submissions))
+
 
 
 if __name__ == '__main__':
     did = ""
+    sync_tags()
     if args.batch:
-        logger.info('\n'*2)
         logger.info("Running batch")
         do_batch(args.batch)
         did += "b"

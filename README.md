@@ -5,7 +5,7 @@ Python tool for automatically tagging users on the Aplus LMS platform.
 1. Update conf.json
   - Set `hook_token` (suggestion: `openssl rand -hex 16`)
   - Get a teacher's (yours, preferrably) API token from the Aplus
-    profile page, and set that as the api_token
+    profile page, and set that as the `api_token`
   - Make sure `course_id` and `exercise_ids` are correct
   - Update tag mappings in `tag_for_form_value`
 2. Set hooks in Aplus (/admin/course/coursehook/)

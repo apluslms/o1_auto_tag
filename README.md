@@ -20,4 +20,9 @@ Python tool for automatically tagging users on the Aplus LMS platform.
     indicating how far back the script should look for submissions to create taggings based on.
   - Server is run forever. It receives hooks from Aplus on submission of exercises, 
     and creates taggings based on the form contents.
+
+## More
+ - There are other flags: -c, --config  -u, --unix  and  -p, --num-proxies
+   These indicate the configuration file path, unix socket path and the number of proxies that set the X-Forwarded-For header, respectively.
+   Unix sockets can be used, but they cause a broken pipe error relatively often for an unknown reason. The X-Forwarded-For header is needed to check the original sender, and the number of proxies tells us if we should trust the header.
     

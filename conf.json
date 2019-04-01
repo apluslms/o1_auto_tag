@@ -1,6 +1,6 @@
 {
-    "api_token":       "fcba67540810f2ed7f8b0a1765163d1427d6fd2f",
-    "base_url":        "http://172.20.0.3:8000/api/v2/",
+    "api_token":       "eb1ec807341ef2df4d998b81b8651181cdf72892",
+    "base_url":        "http://172.18.0.3:8000/api/v2/",
     "course_id":       1,
     "exercise_ids":    [439],
     "server_address":  ["", 8888],

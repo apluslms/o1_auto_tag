@@ -2,13 +2,14 @@
 import datetime
 import json
 import logging
+import os
 import queue
 import requests
 import socket
 import time
 from argparse import ArgumentParser
 from http.server import BaseHTTPRequestHandler, HTTPServer
-from socketserver import UnixStreamServer
+from socketserver import UnixStreamServer, TCPServer
 from itertools import chain
 from pprint import pprint, pformat
 from queue_worker import Worker
@@ -109,7 +110,7 @@ def add_tagging(exercise_id, submission_id):
         return
     logger.info("Submission with id %s", submission_id)
     submission = get_submission(submission_id)
-    if not submission:
+    if submission is None:
         logger.warning("Submission fetch failed. API token is likely invalid.")
         return
 
@@ -121,9 +122,9 @@ def add_tagging(exercise_id, submission_id):
         r_tagging = post_tagging(data)
         logger.debug("Response with %s", r_tagging.status_code)
         if r_tagging.status_code == requests.codes.created: # 201
-            logger.info("Added tagging %s to user %s", data['tag'], data['user'])
+            logger.info("Added tagging %s to user %s\n", data['tag'], data['user'])
         else:
-            logger.debug("%s\n ", r_tagging.json())
+            logger.debug("%s\n", r_tagging.json())
 
 
 class IntervalCallQueue():
@@ -162,11 +163,44 @@ class QueuingHTTPServer(QueueMixin, HTTPServer):
 
 
 class QueuingUnixServer(QueueMixin, UnixStreamServer):
-    pass
+    def server_bind(self):
+        try:
+      	    os.unlink(self.server_address)
+        except OSError:
+            if os.path.exists(self.server_address):
+                raise
+        super().server_bind()
+        os.chmod(self.server_address,int('766',8))
+        return
+
+    def get_request(self):
+        request, client_address = self.socket.accept()
+        # BaseHTTPRequestHandler expects a tuple with the client address at index 0
+        # UnixStreamServer doesn't give an address, so we add a default
+        client_address = ('UnixSocket',)
+        return (request, client_address)
+
+    def server_close(self):
+        super().server_close()
+        try:
+            os.unlink(self.server_address)
+        except OSError:
+            if os.path.exists(self.server_address):
+                raise
 
 
 class APlusCourseHookHTTPRequestHandler(BaseHTTPRequestHandler):
-    def do_POST(self):
+    def do_POST(self):         
+        if 'X-Forwarded-For' not in self.headers:
+            logger.debug('Header X-Forwaded-For is missing')
+            send_response(self, 400, msg='Header X-Forwarded-For not given')
+            return
+        addresses = [address.strip() for address in self.headers['X-Forwarded-For'].split(',')]
+        if len(addresses) != CONF['num_proxies']:
+            logger.debug('X-Forward-For implies %s proxies, arguments %s', len(addresses), CONF['num_proxies'])
+            send_response(self, 400, msg="X-Forward-For doesn't match number of proxies")
+            return
+        self.client_address = (addresses[0],)
         parameters = parse_qs(urlsplit(self.path).query)
         content_length = int(self.headers['Content-Length'])
         post_data = parse_qs(self.rfile.read(content_length).decode('utf-8'))
@@ -181,25 +215,28 @@ class APlusCourseHookHTTPRequestHandler(BaseHTTPRequestHandler):
         base_url_netloc = urlsplit(CONF['base_url']).netloc 
         reported_netloc = reported_site_parsed.netloc
         if base_url_netloc != reported_netloc:
-            logger.debug('base_url netloc in config %s doesn\'t match POST parameter \'site\' %s netloc', 
+            logger.debug("base_url netloc in config %s doesn't match POST parameter 'site' %s netloc", 
                          base_url_netloc, reported_netloc)
             send_response(self, 400, msg="Base url given in parameter 'site' does not match config")
             return
         supposed_ips = get_url_ip_address_list(reported_site_parsed.hostname)
         client_ip = self.client_address[0]
         if client_ip not in supposed_ips: 
-            logger.debug('Client ip %s doesn\'t match reported ips %s in POST body', client_ip, supposed_ips)
+            logger.debug("Client ip %s doesn't match reported ips %s in POST body", client_ip, supposed_ips)
             send_response(self, 400, msg="Deceptive: client does not match POST parameter 'site' after resolve")
             return
-
-        exercise_id, *_ = (int(id) for id in post_data['exercise_id'])
-        submission_id, *_ = (int(id) for id in post_data['submission_id'])
+        logger.debug(pformat(dict(post_data)))
+        exercise_id = next((int(ID) for ID in post_data['exercise_id']), None)
+        submission_id = next((int(ID) for ID in post_data['submission_id']), None)
         self.server.call_queue.schedule(add_tagging, exercise_id, submission_id)
         send_response(self, 204, msg="OK")
 
 
 def sync_tags():
     usertags = get_usertags()
+    if usertags is None:
+        logger.warning("Usertag fetch failed. API token is likely invalid.")
+        return
     existing_slugs = [tag['slug'] for tag in usertags]
     for field_name, value_to_slug in CONF['tag_for_form_value'].items():
         missing_mappings = filter(lambda x: x[1] not in existing_slugs, value_to_slug.items())
@@ -215,7 +252,8 @@ def sync_tags():
 
 def run_server(server_class=QueuingHTTPServer,
                handler_class=APlusCourseHookHTTPRequestHandler):
-    httpd = server_class(tuple(CONF['server_address']), handler_class)
+    loc = CONF['server_address']
+    httpd = server_class(loc, handler_class)
     try:
         httpd.serve_forever()
     except KeyboardInterrupt:
@@ -267,7 +305,6 @@ def setup(conf_file):
     api.set_base_url_from(CONF['base_url'])
 
     sess = requests.Session()
-
     logging.basicConfig()
 
 
@@ -277,9 +314,13 @@ def main():
     p.add_argument('-v', '--verbose', action='count',
                help="Print more information, stackable")
     p.add_argument('-s', '--server', action='store_true', 
-               help="Run the server")
-    p.add_argument('-b', '--batch',
-               help="Run a batch job, go through tags from last N hours", type=int)
+               help="Run the server")    
+    p.add_argument('-u', '--unix',
+               help="Run a Unix filesocket server instead of the HTTP one, supply path to socket")
+    p.add_argument('-p', '--num_proxies', type=int, default=1,
+               help="The number of proxies between A-plus and here (that set X-Forwaded-For)")
+    p.add_argument('-b', '--batch', type=int,
+               help="Run a batch job, go through tags from last N hours")
     args = p.parse_args()
     
     setup(args.config)
@@ -298,7 +339,13 @@ def main():
         did += "b"
     if args.server:
         logger.info("Running server")
-        run_server()
+        CONF['num_proxies'] = args.num_proxies
+        if args.unix:
+            CONF['server_address'] = args.unix.encode('utf-8')
+            run_server(server_class=QueuingUnixServer)
+        else:
+            CONF['server_address'] = tuple(CONF['server_address'])
+            run_server()
         did += "s"
     if did == "":
         logger.warning("No flags given")

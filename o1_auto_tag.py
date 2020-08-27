@@ -19,14 +19,9 @@ from urllib.parse import parse_qs, urlsplit
 from aplus_client.client import AplusTokenClient, AplusApiList, AplusApiDict
 from cachetools import cached, TTLCache
 
-#TODO:
-''' 
-README.md
-'''
-
 
 this_logger_name = "TagLogger"
-logger = logging.getLogger(this_logger_name) 
+logger = logging.getLogger(this_logger_name)
 
 
 def get_submission(submission_id):
@@ -47,10 +42,10 @@ def post_tagging(data):
 
 def post_usertag(**data):
     return api.do_post('{courses_url}{course_id}{usertags_url}'
-                       .format(**CONF), json=data)    
+                       .format(**CONF), json=data)
 
 def default_tag(name, slug):
-    return { 
+    return {
                "name":                name,
                "slug":                slug,
                "description":         'Auto added by o1_auto_tag.py',
@@ -60,15 +55,27 @@ def default_tag(name, slug):
 
 def how_recent_in_hours(ISO8601_datetime_string):
     # Times in UTC
-    datetime_other = datetime.datetime.strptime(ISO8601_datetime_string, "%Y-%m-%dT%H:%M:%S.%fZ")
-    datetime_now   = datetime.datetime.utcnow()
+    if ISO8601_datetime_string[-6] in '+-' and ISO8601_datetime_string[-3] == ':':
+        # converts +03:00 to +0300
+        ISO8601_datetime_string = ISO8601_datetime_string[:-3] + ISO8601_datetime_string[-2:]
+    if ISO8601_datetime_string[-1] == 'Z':
+        datetime_other = datetime.datetime.strptime(ISO8601_datetime_string, "%Y-%m-%dT%H:%M:%S.%fZ")
+    else:
+        datetime_other = datetime.datetime.strptime(ISO8601_datetime_string, "%Y-%m-%dT%H:%M:%S.%f%z")
+        datetime_other = datetime_other.astimezone(datetime.timezone.utc)
+        datetime_other = datetime_other.replace(tzinfo=None)
+    datetime_now = datetime.datetime.utcnow()
     time_delta = datetime_now - datetime_other
     time_delta_hours = time_delta.total_seconds() / 3600
     return round(time_delta_hours, 1)
 
 @cached(TTLCache(100, ttl=30))
 def get_url_ip_address_list(hostname):
-    ips = (a[4][0] for a in socket.getaddrinfo(hostname, None, 0, socket.SOCK_STREAM, socket.IPPROTO_TCP))
+    try:
+        ips = (a[4][0] for a in socket.getaddrinfo(hostname, None, 0, socket.SOCK_STREAM, socket.IPPROTO_TCP))
+    except socket.gaierror:
+        logger.debug("Not address found for %r", hostname)
+        ips = ()
     return tuple(set(ips))
 
 def send_response(Handler, code, headers=None, msg=""):
@@ -86,10 +93,11 @@ def submission_to_tag_post(submission):
     submitters = submission['submitters']
     submission_data = submission.get_item('submission_data')
     logger.debug("submission data: \n%s", pformat(submission_data))
-    tag_slugs = (CONF['tag_for_form_value'][field[0]][field[1]]
-                 for field in submission_data
-                 if    field[0] in CONF['tag_for_form_value']
-                   and field[1] in CONF['tag_for_form_value'][field[0]])
+    tag_map = CONF['tag_for_form_value']
+    tag_slugs = (tag_map[field_name][field_value]
+                 for field_name, field_value in submission_data
+                 if field_name in tag_map and
+                    field_value in tag_map[field_name])
     user_ids = (submitter['id'] for submitter in submitters)
     post_dataset = (
         {
@@ -136,7 +144,7 @@ class IntervalCallQueue():
                 f, args = self.queue.get_nowait()
                 f(*args)
         self._workers = [Worker(self._queue, self.stop_marker, interval_s) for _ in range(CONF["worker_count"])]
-    
+
     def schedule(self, f, *args):
         self._queue.put((f, args))
 
@@ -148,16 +156,16 @@ class IntervalCallQueue():
             logger.info("Worker #{number} stopped".format(number=i+1))
 
 
-class QueueMixin: 
+class QueueMixin:
     def __init__(self, *args, **kwargs):
         self.call_queue = IntervalCallQueue(CONF["worker_interval"])
         super().__init__(*args, **kwargs)
-    
+
     def server_close(self):
         self.call_queue.stop()
         super().server_close()
 
-    
+
 class QueuingHTTPServer(QueueMixin, HTTPServer):
     pass
 
@@ -190,7 +198,7 @@ class QueuingUnixServer(QueueMixin, UnixStreamServer):
 
 
 class APlusCourseHookHTTPRequestHandler(BaseHTTPRequestHandler):
-    def do_POST(self):         
+    def do_POST(self):
         if 'X-Forwarded-For' not in self.headers:
             logger.debug('Header X-Forwaded-For is missing')
             send_response(self, 400, msg='Header X-Forwarded-For not given')
@@ -211,14 +219,19 @@ class APlusCourseHookHTTPRequestHandler(BaseHTTPRequestHandler):
             logger.debug('Hook token doesn\'t match or was missing in POST')
             send_response(self, 401, msg='Bad auth token: missing or invalid')
             return
-        reported_site_parsed = urlsplit(post_data.get('site')[0])
-        base_url_netloc = urlsplit(CONF['base_url']).netloc 
-        reported_netloc = reported_site_parsed.netloc
-        if base_url_netloc != reported_netloc:
-            logger.debug("base_url netloc in config %s doesn't match POST parameter 'site' %s netloc", 
-                         base_url_netloc, reported_netloc)
-            send_response(self, 400, msg="Base url given in parameter 'site' does not match config")
+        reported_site = next(iter(post_data.get('site', ())), None)
+        if not reported_site:
+            logger.debug("Hook data doesn't contain a site")
+            send_response(self, 400, msg="Bad request, missing site")
             return
+        reported_site_parsed = urlsplit(reported_site)
+        #base_url_netloc = urlsplit(CONF['base_url']).netloc 
+        #reported_netloc = reported_site_parsed.netloc
+        #if base_url_netloc != reported_netloc:
+        #    logger.debug("base_url netloc in config %s doesn't match POST parameter 'site' %s netloc", 
+        #                 base_url_netloc, reported_netloc)
+        #    send_response(self, 400, msg="Base url given in parameter 'site' does not match config")
+        #    return
         supposed_ips = get_url_ip_address_list(reported_site_parsed.hostname)
         client_ip = self.client_address[0]
         if client_ip not in supposed_ips: 
@@ -226,8 +239,13 @@ class APlusCourseHookHTTPRequestHandler(BaseHTTPRequestHandler):
             send_response(self, 400, msg="Deceptive: client does not match POST parameter 'site' after resolve")
             return
         logger.debug(pformat(dict(post_data)))
-        exercise_id = next((int(ID) for ID in post_data['exercise_id']), None)
-        submission_id = next((int(ID) for ID in post_data['submission_id']), None)
+        try:
+            exercise_id = int(next(iter(post_data.get('exercise_id', ())), None))
+            submission_id = int(next(iter(post_data.get('submission_id', ())), None))
+        except (KeyError, ValueError, TypeError):
+            logger.debug("Missing or invalid exercise_id or submission_id")
+            send_response(self, 400, msg="Invalid or missing exercise_id or submission_id")
+            return
         self.server.call_queue.schedule(add_tagging, exercise_id, submission_id)
         send_response(self, 204, msg="OK")
 
@@ -308,7 +326,7 @@ def setup(conf_file):
     logging.basicConfig()
 
 
-def main(): 
+def main():
     p = ArgumentParser()
     p.add_argument('-c', '--config', type=str, default='conf.json')
     p.add_argument('-v', '--verbose', action='count',
@@ -322,14 +340,15 @@ def main():
     p.add_argument('-b', '--batch', type=int,
                help="Run a batch job, go through tags from last N hours")
     args = p.parse_args()
-    
+
     setup(args.config)
 
-    logger.setLevel(level=logging.WARNING if args.verbose == None else
-                          logging.INFO    if args.verbose == 1 else 
-                          logging.DEBUG   if args.verbose == 2 else 
-                          logging.DEBUG)
- 
+    logging.getLogger().setLevel(level=
+        logging.WARNING if args.verbose == None else
+        logging.INFO    if args.verbose == 1 else
+        logging.DEBUG   if args.verbose == 2 else
+        logging.DEBUG)
+
     sync_tags()
 
     did = ""
@@ -351,5 +370,5 @@ def main():
         logger.warning("No flags given")
 
 
-if __name__ == '__main__': 
+if __name__ == '__main__':
     main()
